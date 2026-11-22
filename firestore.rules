@@ -1,0 +1,856 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    // Staff helpers: role and status always come from the users doc,
+    // which owners can't change (see the users rules below).
+    function isActiveAdmin() {
+      let path = /databases/$(database)/documents/users/$(request.auth.uid);
+      return signedIn()
+      && exists(path)
+      && get(path).data.role == 'admin'
+      && get(path).data.accountStatus == 'active';
+    }
+
+    function isActiveSupport(uid) {
+      let path = /databases/$(database)/documents/users/$(uid);
+      return exists(path)
+      && get(path).data.role == 'support'
+      && get(path).data.accountStatus == 'active';
+    }
+
+    function canReadStaffThread(supportUid) {
+      return (isOwner(supportUid) && isActiveSupport(supportUid))
+      || isActiveAdmin();
+    }
+
+    // Messaging helpers: a conversation is only usable while its
+    // supportLinks document (same id) exists and is accepted.
+    function activeLink(convId) {
+      return exists(/databases/$(database)/documents/supportLinks/$(convId))
+      && get(/databases/$(database)/documents/supportLinks/$(convId)).data.status == 'accepted';
+    }
+
+    function linkData(convId) {
+      return get(/databases/$(database)/documents/supportLinks/$(convId)).data;
+    }
+
+    // ---------------------------------------------------------
+    // USER PROFILE
+    // ---------------------------------------------------------
+
+    match /users/{uid} {
+
+      // Only the owner can read their profile.
+      allow read: if isOwner(uid);
+
+      // role and accountStatus are trusted by every other rule and Cloud
+      // Function, so an owner must never be able to change them. Edits
+      // can't touch them (update below), and an owner can't delete the
+      // profile (delete below), so it can't be removed and recreated.
+
+      // On creation: must be your own document,
+      // role must be "user" or "support", and only expected fields are allowed.
+      // The admin-only fields statusUpdatedAt, statusUpdatedBy,
+      // roleUpdatedAt and roleUpdatedBy are not in the list, so a new
+      // profile can't include them.
+      // "create" only applies when no document exists yet. Writing over an
+      // existing profile (set, or set with merge) is checked as an update.
+      allow create: if isOwner(uid)
+      && request.resource.data.role in ['user', 'support']
+      && request.resource.data.accountStatus == 'active'
+      && request.resource.data.email == request.auth.token.email
+      && request.resource.data.keys().hasOnly([
+        'displayName',
+        'legalName',
+        'email',
+        'phoneNumber',
+        'address',
+        'role',
+        'accountStatus',
+        'regionId',
+        'createdAt',
+        'uploadedDocuments'
+      ]);
+
+      // Owner can update normal profile fields,
+      // but cannot change protected fields. statusUpdatedAt/statusUpdatedBy
+      // are written only by setAccountStatus, and roleUpdatedAt/roleUpdatedBy
+      // only by setAccountRole.
+      allow update: if isOwner(uid)
+      && !request.resource.data
+        .diff(resource.data)
+        .affectedKeys()
+        .hasAny([
+        'role',
+        'accountStatus',
+        'createdAt',
+        'statusUpdatedAt',
+        'statusUpdatedBy',
+        'roleUpdatedAt',
+        'roleUpdatedBy'
+      ]);
+
+      // Owners can't delete their profile. Allowing it would let a
+      // suspended or disabled account delete the profile and create a new
+      // one as "active" (or switch between user and support). Account
+      // removal has to go through a trusted backend.
+      allow delete: if false;
+
+
+      // -------------------------------------------------------
+      // TRUSTED CONTACTS
+      // -------------------------------------------------------
+
+
+      match /trustedContacts/{contactId} {
+
+        function validEmergencyContact(data) {
+          return data.get('emergencyContact', false) is bool
+          && data.get('emergencyEmailOptIn', false) is bool
+          && data.get('emergencyInAppOptIn', false) is bool
+          && data.get('emergencySmsRecipient', false) is bool
+
+          && data.get('email', '') is string
+          && data.get('email', '').size() <= 254
+
+          // Notification opt-ins require emergency designation.
+          && (
+            data.get('emergencyContact', false) == true
+            || (
+              data.get('emergencyEmailOptIn', false) == false
+              && data.get('emergencyInAppOptIn', false) == false
+            )
+          )
+
+          // Email opt-in requires a basic valid email format.
+          && (
+            data.get('emergencyEmailOptIn', false) == false
+            || data.get('email', '').matches(
+              '^[^@ ]+@[^@ ]+[.][^@ .]+$'
+            )
+          )
+
+          // Retain compatibility with legacy SMS data.
+          && (
+            data.get('emergencySmsRecipient', false) == false
+            || (
+              data.phoneNumber is string
+              && data.phoneNumber.matches(
+                '^[+][1-9][0-9]{7,14}$'
+              )
+            )
+          );
+        }
+
+
+        function allowedContactFields(data) {
+          return data.keys().hasOnly([
+            'name',
+            'phoneNumber',
+            'relationship',
+            'accessGiven',
+            'linkedUserId',
+            'privateNotes',
+            'safeToStay',
+            'email',
+            'categories',
+            'createdAt',
+            'updatedAt',
+            'contactCreatedAtMillis',
+            'contactUpdatedAtMillis',
+            'emergencySmsRecipient',
+            'emergencyContact',
+            'emergencyEmailOptIn',
+            'emergencyInAppOptIn'
+          ]);
+        }
+
+
+        allow read: if isOwner(uid)
+        || (signedIn() && resource.data.get('linkedUserId', '') == request.auth.uid);
+
+        allow delete: if isOwner(uid);
+
+        allow create: if isOwner(uid)
+        && allowedContactFields(request.resource.data)
+        && validEmergencyContact(request.resource.data);
+
+        allow update: if isOwner(uid)
+        && allowedContactFields(request.resource.data)
+        && validEmergencyContact(request.resource.data);
+      }
+
+      // PERSONAL SUPPORT HOTLINES
+      match /supportHotlines/{hotlineId} {
+
+        function validHotline(data) {
+          return data.keys().hasAll([
+            'name', 'phoneNumber', 'notes', 'createdAt', 'updatedAt'
+          ])
+          && data.keys().hasOnly([
+            'name', 'phoneNumber', 'notes', 'createdAt', 'updatedAt'
+          ])
+          && data.name is string
+          && data.name.size() > 0
+          && data.name.size() <= 100
+          && data.phoneNumber is string
+          && data.phoneNumber.matches('^[+]?[0-9]{3,15}$')
+          && data.notes is string
+          && data.notes.size() <= 1000
+          && data.createdAt is timestamp
+          && data.updatedAt is timestamp;
+        }
+
+        allow read, delete: if isOwner(uid);
+
+        allow create: if isOwner(uid)
+        && validHotline(request.resource.data)
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time;
+
+        allow update: if isOwner(uid)
+        && validHotline(request.resource.data)
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.updatedAt == request.time;
+      }
+
+
+      // EMERGENCY ALERT SETTINGS
+      match /emergencySettings/{settingsId} {
+        allow read: if isOwner(uid)
+        && settingsId == 'preset';
+
+        allow create, update: if isOwner(uid)
+        && settingsId == 'preset'
+        && request.resource.data.keys().hasAll([
+          'message', 'receiveInApp'
+        ])
+        && request.resource.data.keys().hasOnly([
+          'message', 'receiveInApp'
+        ])
+        && request.resource.data.message is string
+        && request.resource.data.message.size() > 0
+        && request.resource.data.message.size() <= 1000
+        && request.resource.data.receiveInApp is bool;
+
+        allow delete: if isOwner(uid)
+        && settingsId == 'preset';
+      }
+
+      // IN-APP EMERGENCY NOTIFICATIONS
+      match /emergencyNotifications/{notificationId} {
+        allow read: if isOwner(uid);
+
+        // Notifications are created by the trusted backend.
+        allow create: if false;
+
+        // Recipient may only mark an existing unread alert as read.
+        allow update: if isOwner(uid)
+        && request.resource.data.diff(resource.data)
+          .affectedKeys().hasOnly(['read'])
+        && resource.data.get('read', null) == false
+        && request.resource.data.read == true;
+
+        allow delete: if false;
+      }
+
+      // -------------------------------------------------------
+      // LOCATION SHARING SETTINGS
+      // -------------------------------------------------------
+
+      match /locationSharing/{documentId} {
+
+        // Private user preferences.
+        allow read, create, update, delete:
+        if isOwner(uid);
+      }
+    }
+
+
+    // ---------------------------------------------------------
+    // LIVE LOCATION SHARES
+    // ---------------------------------------------------------
+
+    match /locationShares/{ownerUid} {
+
+      // Sender OR an explicitly linked recipient can read.
+      allow read:
+      if signedIn()
+      && (
+        request.auth.uid == ownerUid
+        ||
+        request.auth.uid in resource.data.recipientIds
+      );
+
+      // Only the sender can create their own share.
+      allow create:
+      if signedIn()
+      && request.auth.uid == ownerUid
+      && request.resource.data.ownerId == ownerUid
+      && request.resource.data.keys().hasOnly([
+        'ownerId',
+        'ownerDisplayName',
+        'selectedContactIds',
+        'recipientIds',
+        'latitude',
+        'longitude',
+        'active',
+        'startedAt',
+        'updatedAt'
+      ]);
+
+      // Only the sender can update.
+      // ownerId must never be changed.
+      // (Fixed: this previously held the emergencyEvents cancel rule.)
+      allow update:
+      if signedIn()
+      && request.auth.uid == ownerUid
+      && request.resource.data.ownerId == ownerUid
+      && resource.data.ownerId == ownerUid
+      && !request.resource.data
+        .diff(resource.data)
+        .affectedKeys()
+        .hasAny(['ownerId']);
+
+      // Only the sender can delete.
+      allow delete:
+      if signedIn()
+      && request.auth.uid == ownerUid;
+    }
+
+    // ---------------------------------------------------------
+    // SUPPORT LINKING
+    // ---------------------------------------------------------
+
+    // SUPPORT LINKING
+    // ---------------------------------------------------------
+
+    // Pairing data is accessed only by the trusted backend.
+    match /supportPairingCodes/{documentId} {
+      allow read, write: if false;
+    }
+
+    match /supportPairingUsers/{documentId} {
+      allow read, write: if false;
+    }
+
+    match /supportPairingLimits/{documentId} {
+      allow read, write: if false;
+    }
+
+    match /supportPairingRedemptions/{documentId} {
+      allow read, write: if false;
+    }
+
+    match /supportLinks/{linkId} {
+
+      // Verify that an account exists, is active,
+      // and has the expected role.
+      function hasActiveRole(uid, expectedRole) {
+        return exists(
+          /databases/$(database)/documents/users/$(uid)
+        )
+        && get(
+          /databases/$(database)/documents/users/$(uid)
+        ).data.role == expectedRole
+        && get(
+          /databases/$(database)/documents/users/$(uid)
+        ).data.accountStatus == 'active';
+      }
+
+      // Only participants can read their connection.
+      allow read: if signedIn()
+      && (
+        request.auth.uid == resource.data.userId
+        || request.auth.uid == resource.data.supportId
+      );
+
+      // Requests are created only by the pairing backend.
+      allow create: if false;
+
+      // Only the User can approve or reject a pending request.
+      allow update: if signedIn()
+      && request.auth.uid == resource.data.userId
+      && resource.data.status == 'pending'
+      && request.resource.data.status in ['accepted', 'rejected']
+      && request.resource.data.userId == resource.data.userId
+      && request.resource.data.supportId == resource.data.supportId
+      && hasActiveRole(resource.data.userId, 'user')
+      && hasActiveRole(resource.data.supportId, 'support')
+      && request.resource.data
+        .diff(resource.data)
+        .affectedKeys()
+        .hasOnly(['status']);
+
+      // Either participant can disconnect or remove a request.
+      allow delete: if signedIn()
+      && (
+        request.auth.uid == resource.data.userId
+        || request.auth.uid == resource.data.supportId
+      );
+    }
+
+
+    // ---------------------------------------------------------
+    // MESSAGING
+    // Conversation id == supportLinks document id.
+    // Nothing here references the admin role, so admins get no access.
+    // Users stay anonymous to support: only the SUPPORT account's name
+    // may ever be stored in participantNames.
+    // ---------------------------------------------------------
+
+    match /conversations/{convId} {
+
+      // Inbox query: whereArrayContains("participants", uid)
+      allow read: if signedIn()
+      && request.auth.uid in resource.data.participants;
+
+      // Only the two people on an ACCEPTED link can create the conversation,
+      // and its participants must match that link exactly.
+      allow create: if signedIn()
+      && activeLink(convId)
+      && request.auth.uid in [linkData(convId).userId, linkData(convId).supportId]
+      && request.resource.data.userId == linkData(convId).userId
+      && request.resource.data.supportId == linkData(convId).supportId
+      && request.resource.data.participants
+      == [linkData(convId).userId, linkData(convId).supportId]
+      && request.resource.data.keys().hasOnly([
+        'participants',
+        'userId',
+        'supportId',
+        'participantNames',
+        'lastMessage',
+        'lastMessageAt',
+        'lastSenderId',
+        'unreadCounts'
+      ])
+      && request.resource.data.get('participantNames', {}).keys()
+        .hasOnly([linkData(convId).supportId]);
+
+      // Participants may update only summary fields,
+      // never who is in the conversation.
+      allow update: if signedIn()
+      && activeLink(convId)
+      && request.auth.uid in resource.data.participants
+      && request.resource.data.participants == resource.data.participants
+      && request.resource.data
+        .diff(resource.data)
+        .affectedKeys()
+        .hasOnly([
+        'participantNames',
+        'lastMessage',
+        'lastMessageAt',
+        'lastSenderId',
+        'unreadCounts'
+      ])
+      && request.resource.data.get('participantNames', {}).keys()
+        .hasOnly([linkData(convId).supportId])
+      && (
+        !('lastSenderId' in request.resource.data
+          .diff(resource.data).affectedKeys())
+        || request.resource.data.lastSenderId == request.auth.uid
+      );
+
+      allow delete: if false;
+
+      match /messages/{messageId} {
+
+        // Reading requires an active approved link. If a connection is
+        // removed, the former contact loses access to the messages.
+        allow read: if signedIn()
+        && activeLink(convId)
+        && request.auth.uid in [linkData(convId).userId, linkData(convId).supportId];
+
+        // A message needs text OR one attachment. The attachment must point at a
+        // file inside THIS conversation's Storage folder.
+        allow create: if signedIn()
+        && activeLink(convId)
+        && request.auth.uid in [linkData(convId).userId, linkData(convId).supportId]
+        && request.resource.data.keys().hasOnly([
+          'senderId',
+          'text',
+          'createdAt',
+          'attachment'
+        ])
+        && request.resource.data.senderId == request.auth.uid
+        && request.resource.data.text is string
+        && request.resource.data.text.size() <= 2000
+        && (
+          request.resource.data.text.size() > 0
+          || 'attachment' in request.resource.data
+        )
+        && (
+          !('attachment' in request.resource.data)
+          || (
+            request.resource.data.attachment is map
+            && request.resource.data.attachment.keys().hasOnly([
+              'name',
+              'path',
+              'size',
+              'contentType'
+            ])
+            && request.resource.data.attachment.name is string
+            && request.resource.data.attachment.name.size() > 0
+            && request.resource.data.attachment.name.size() <= 255
+            && request.resource.data.attachment.size is number
+            && request.resource.data.attachment.contentType is string
+            && request.resource.data.attachment.path is string
+            && request.resource.data.attachment.path.matches(
+              'message-files/' + convId + '/[^/]+'
+            )
+          )
+        )
+        && request.resource.data.createdAt == request.time;
+
+        // Messages are immutable.
+        allow update, delete: if false;
+      }
+    }
+
+    // ---------------------------------------------------------
+    // VOICE DURESS EVENTS
+    // ---------------------------------------------------------
+
+    match /emergencyEvents/{eventId} {
+
+      function matchesLiveShare(data) {
+        let share = getAfter(
+          /databases/$(database)/documents/locationShares/$(request.auth.uid)
+        ).data;
+
+        return share.ownerId == request.auth.uid
+        && share.active == true
+        && data.recipientIds == share.recipientIds;
+      }
+
+      // Only the owner and the event's recipients can read.
+      allow read: if signedIn()
+      && (
+        request.auth.uid == resource.data.ownerId
+        || request.auth.uid in resource.data.recipientIds
+      );
+
+      // Create an event for the owner's active location share.
+      allow create: if signedIn()
+      && request.resource.data.keys().hasAll([
+        'ownerId',
+        'recipientIds',
+        'triggerType',
+        'status',
+        'startedAt',
+        'updatedAt'
+      ])
+      && request.resource.data.keys().hasOnly([
+        'ownerId',
+        'recipientIds',
+        'triggerType',
+        'status',
+        'startedAt',
+        'updatedAt'
+      ])
+      && request.resource.data.ownerId == request.auth.uid
+      && request.resource.data.recipientIds is list
+      && request.resource.data.recipientIds.size() > 0
+      && request.resource.data.triggerType == 'voice_duress'
+      && request.resource.data.status == 'active'
+      && request.resource.data.startedAt == request.time
+      && request.resource.data.updatedAt == request.time
+      && matchesLiveShare(request.resource.data);
+
+      // The owner can cancel an active event.
+      // Recipients and other event details cannot be changed.
+      allow update: if signedIn()
+      && resource.data.ownerId == request.auth.uid
+      && resource.data.triggerType == 'voice_duress'
+      && resource.data.status == 'active'
+      && request.resource.data.status == 'cancelled'
+      && request.resource.data.updatedAt == request.time
+      && request.resource.data
+        .diff(resource.data)
+        .affectedKeys()
+        .hasOnly(['status', 'updatedAt']);
+
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------
+    // REGIONAL RESOURCES
+    // ---------------------------------------------------------
+
+    match /regionalResources/{regionId}/resources/{resourceId} {
+
+      // Signed-in users can browse published resources.
+      allow read: if signedIn()
+      && resource.data.published == true;
+
+      // Clients can't write resources directly. Admins edit them through the
+      // listAdminRegionalResources and updateAdminRegionalResource callable
+      // Cloud Functions (functions/adminResources.js), which check for an
+      // active admin and write with the Admin SDK.
+      allow create, update, delete: if false;
+    }
+
+    // ---------------------------------------------------------
+    // DOCUMENT FILES AND TRUSTED-CONTACT SHARING
+    // ---------------------------------------------------------
+
+    function activeDocumentContact(ownerUid, contactId, recipientUid) {
+      let contactPath = /databases/$(database)/documents/users/$(ownerUid)/trustedContacts/$(contactId);
+
+      return exists(contactPath)
+      && get(contactPath).data.get('linkedUserId', '') == recipientUid
+      && get(contactPath).data.get('accessGiven', false) == true;
+    }
+
+    function validDocumentRecipient(data) {
+      return (
+        data.get('recipientType', 'trustedContact') == 'trustedContact'
+        && activeDocumentContact(
+          data.ownerUid,
+          data.contactId,
+          data.recipientUid
+        )
+      ) || (
+        data.get('recipientType', '') == 'support'
+        && activeDocumentSupport(data)
+      );
+    }
+
+    function activeDocumentSupport(data) {
+      let linkId = data.ownerUid + '_' + data.recipientUid;
+      let linkPath =
+      /databases/$(database)/documents/supportLinks/$(linkId);
+
+      return data.supportLinkId == linkId
+      && data.supportLinkCreatedAt is timestamp
+      && exists(linkPath)
+      && get(linkPath).data.userId == data.ownerUid
+      && get(linkPath).data.supportId == data.recipientUid
+      && get(linkPath).data.status == 'accepted'
+      && get(linkPath).data.createdAt == data.supportLinkCreatedAt;
+    }
+
+    function canReadSharedDocument(documentId, ownerUid) {
+      let shareId = documentId + '_' + request.auth.uid;
+      let sharePath =
+      /databases/$(database)/documents/documentShares/$(shareId);
+
+      return exists(sharePath)
+      && get(sharePath).data.documentId == documentId
+      && get(sharePath).data.ownerUid == ownerUid
+      && get(sharePath).data.recipientUid == request.auth.uid
+      && validDocumentRecipient(get(sharePath).data);
+    }
+
+    match /documentFiles/{documentId} {
+
+      function validDocument(data) {
+        return data.keys().hasAll([
+          'ownerUid',
+          'name',
+          'type',
+          'cloudStoragePath',
+          'contentType',
+          'sizeBytes',
+          'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerUid',
+          'name',
+          'type',
+          'cloudStoragePath',
+          'contentType',
+          'sizeBytes',
+          'createdAt'
+        ])
+        && documentId.matches('^[a-zA-Z0-9-]{1,128}$')
+        && data.ownerUid == request.auth.uid
+        && data.name is string
+        && data.name.size() > 0
+        && data.name.size() <= 255
+        && data.type is string
+        && data.type.size() > 0
+        && data.type.size() <= 150
+        && data.contentType is string
+        && data.contentType.size() > 0
+        && data.contentType.size() <= 150
+        && data.sizeBytes is int
+        && data.sizeBytes > 0
+        && data.sizeBytes <= 20 * 1024 * 1024
+        && data.cloudStoragePath ==
+        'protectedDocuments/' + request.auth.uid
+        + '/' + documentId + '/content'
+        && data.createdAt == request.time;
+      }
+
+      // Owners can fetch their documents.
+      // Selected recipients can fetch a specific shared document.
+      allow get: if signedIn()
+      && (
+        resource.data.ownerUid == request.auth.uid
+        || canReadSharedDocument(
+          documentId,
+          resource.data.ownerUid
+        )
+      );
+
+      // The owner's list must query by ownerUid.
+      // Recipients discover documents through documentShares.
+      allow list: if signedIn()
+      && resource.data.ownerUid == request.auth.uid;
+
+      allow create: if signedIn()
+      && validDocument(request.resource.data);
+
+      // Sharing permissions are managed separately.
+      allow update: if false;
+
+      allow delete: if signedIn()
+      && resource.data.ownerUid == request.auth.uid;
+    }
+
+    match /documentShares/{shareId} {
+
+      function validShare(data) {
+        return data.keys().hasAll([
+          'documentId',
+          'ownerUid',
+          'recipientUid',
+          'createdAt'
+        ])
+        && data.documentId is string
+        && data.documentId.matches('^[a-zA-Z0-9-]{1,128}$')
+        && data.ownerUid == request.auth.uid
+        && data.recipientUid is string
+        && data.recipientUid.size() > 0
+        && data.recipientUid.size() <= 128
+        && data.recipientUid != request.auth.uid
+        && shareId == data.documentId + '_' + data.recipientUid
+        && data.createdAt == request.time
+        && get(
+          /databases/$(database)/documents/documentFiles/$(data.documentId)
+        ).data.ownerUid == request.auth.uid
+        && (
+          (
+            data.keys().hasAll(['contactId'])
+            && data.keys().hasOnly([
+              'documentId',
+              'ownerUid',
+              'recipientUid',
+              'contactId',
+              'createdAt'
+            ])
+            && data.contactId is string
+            && data.contactId.matches('^[^/]{1,128}$')
+            && activeDocumentContact(
+              data.ownerUid,
+              data.contactId,
+              data.recipientUid
+            )
+          )
+          ||
+          (
+            data.keys().hasAll([
+              'recipientType',
+              'supportLinkId',
+              'supportLinkCreatedAt'
+            ])
+            && data.keys().hasOnly([
+              'documentId',
+              'ownerUid',
+              'recipientUid',
+              'recipientType',
+              'supportLinkId',
+              'supportLinkCreatedAt',
+              'createdAt'
+            ])
+            && data.recipientType == 'support'
+            && data.supportLinkId is string
+            && data.supportLinkCreatedAt is timestamp
+            && activeDocumentSupport(data)
+          )
+        );
+      }
+
+      // Participants can discover their grants.
+      // Reading document contents requires current recipient access.
+      allow read: if signedIn()
+      && (
+        resource.data.ownerUid == request.auth.uid
+        || resource.data.recipientUid == request.auth.uid
+      );
+
+      // Only the document owner can grant access.
+      allow create: if signedIn()
+      && validShare(request.resource.data);
+
+      // Remove an existing grant before granting access again.
+      allow update: if false;
+
+      // The owner can revoke even after a connection is removed.
+      allow delete: if signedIn()
+      && resource.data.ownerUid == request.auth.uid;
+    }
+
+    // ---------------------------------------------------------
+    // ADMIN <-> SUPPORT STAFF MESSAGING
+    // Thread id == the support account's uid. Written only by the
+    // sendStaffMessage and markStaffConversationRead Cloud Functions.
+    // Documents store the sender's role, never an admin's uid or name.
+    // ---------------------------------------------------------
+
+    match /staffConversations/{supportUid} {
+      allow read: if canReadStaffThread(supportUid);
+      allow write: if false;
+
+      match /messages/{messageId} {
+        allow read: if canReadStaffThread(supportUid);
+        allow write: if false;
+      }
+    }
+
+    // Server-only: sender uids per message, and the send rate limit.
+    match /staffMessageAudit/{entryId} {
+      allow read, write: if false;
+    }
+
+    match /staffMessageLimits/{senderUid} {
+      allow read, write: if false;
+    }
+
+    // ---------------------------------------------------------
+    // EVERYTHING ELSE DENIED
+    // ---------------------------------------------------------
+
+    // Emergency guidance is accessed through authenticated backend functions.
+    match /emergencyGuides/{guideId} {
+      allow read, write: if false;
+    }
+
+    // ---------------------------------------------------------
+    // ADMIN AUDIT LOG
+    // ---------------------------------------------------------
+
+    // Written only by the setAccountStatus and setAccountRole Cloud
+    // Functions (Admin SDK).
+    // No client, including an admin, can read, list or write it.
+    match /adminAuditLog/{entryId} {
+      allow read, write: if false;
+    }
+
+    match /{document=**} {
+
+      allow read, write: if false;
+    }
+  }
+}

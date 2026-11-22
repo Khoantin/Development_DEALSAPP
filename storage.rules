@@ -1,0 +1,138 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function isOwner(uid) {
+      return request.auth != null
+      && request.auth.uid == uid;
+    }
+
+    function hasTrustedDocumentAccess(ownerUid, share) {
+      let contactPath =
+      /databases/(default)/documents/users/$(ownerUid)/trustedContacts/$(share.contactId);
+
+      return firestore.exists(contactPath)
+      && firestore.get(contactPath).data.get('linkedUserId', '')
+      == request.auth.uid
+      && firestore.get(contactPath).data.get('accessGiven', false)
+      == true;
+    }
+
+    function hasSupportDocumentAccess(ownerUid, share) {
+      let linkId = ownerUid + '_' + request.auth.uid;
+      let linkPath =
+      /databases/(default)/documents/supportLinks/$(linkId);
+
+      return share.supportLinkId == linkId
+      && share.supportLinkCreatedAt is timestamp
+      && firestore.exists(linkPath)
+      && firestore.get(linkPath).data.userId == ownerUid
+      && firestore.get(linkPath).data.supportId == request.auth.uid
+      && firestore.get(linkPath).data.status == 'accepted'
+      && firestore.get(linkPath).data.createdAt
+      == share.supportLinkCreatedAt;
+    }
+
+    function hasDocumentAccess(ownerUid, documentId) {
+      let shareId = documentId + '_' + request.auth.uid;
+      let sharePath =
+      /databases/(default)/documents/documentShares/$(shareId);
+
+      return firestore.exists(sharePath)
+      && firestore.get(sharePath).data.ownerUid == ownerUid
+      && firestore.get(sharePath).data.documentId == documentId
+      && firestore.get(sharePath).data.recipientUid == request.auth.uid
+      && (
+        (
+          firestore.get(sharePath).data.get(
+            'recipientType', 'trustedContact'
+          ) == 'trustedContact'
+          && hasTrustedDocumentAccess(
+            ownerUid,
+            firestore.get(sharePath).data
+          )
+        )
+        ||
+        (
+          firestore.get(sharePath).data.get(
+            'recipientType', ''
+          ) == 'support'
+          && hasSupportDocumentAccess(
+            ownerUid,
+            firestore.get(sharePath).data
+          )
+        )
+      );
+    }
+
+    // Preserve the existing owner-only uploads.
+    match /users/{uid}/{allPaths=**} {
+      allow read, write: if isOwner(uid);
+    }
+
+    // New files that support document-level sharing.
+    match /protectedDocuments/{ownerUid}/{documentId}/content {
+
+      allow get: if request.auth != null
+      && (
+        isOwner(ownerUid)
+        || hasDocumentAccess(ownerUid, documentId)
+      );
+
+      allow create: if isOwner(ownerUid)
+      && resource == null
+      && documentId.matches('^[a-zA-Z0-9-]{1,128}$')
+      && request.resource.size > 0
+      && request.resource.size <= 20 * 1024 * 1024;
+
+      // File contents cannot be overwritten after upload.
+      allow update: if false;
+
+      allow delete: if isOwner(ownerUid);
+    }
+
+    // Messaging files are available only to an accepted link's participants.
+    match /message-files/{conversationId}/{fileName} {
+
+      function isMessagingParticipant() {
+        let link = firestore.get(
+          /databases/(default)/documents/supportLinks/$(conversationId)
+        ).data;
+
+        return link.status == 'accepted'
+        && request.auth.uid in [link.userId, link.supportId];
+      }
+
+      function allowedMessageFile() {
+        return request.resource.size > 0
+        && request.resource.size <= 10 * 1024 * 1024
+        && (
+          request.resource.contentType.matches('image/.*')
+          || request.resource.contentType in [
+            'application/pdf',
+            'text/plain',
+            'application/msword',
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+          ]
+        );
+      }
+
+      allow get: if request.auth != null
+      && isMessagingParticipant();
+
+      allow create: if request.auth != null
+      && resource == null
+      && isMessagingParticipant()
+      && allowedMessageFile();
+
+      // Attachments cannot be replaced or deleted by either participant.
+      allow update, delete: if false;
+      allow list: if false;
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

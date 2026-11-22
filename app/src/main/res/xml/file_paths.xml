@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Files opened from messages (downloaded to the app cache) -->
+    <cache-path name="message_files" path="message_files/" />
+
+    <!-- Documents saved by the existing Documents page -->
+    <files-path name="saved_documents" path="." />
+</paths>
